@@ -88,13 +88,17 @@ class Integration(unittest.TestCase):
         for args in [("kill",), ("kill", "0"), ("kill", "-1"), ("kill", "1"),
                      ("kill", "12x"), ("kill", "99999999999999999999999"),
                      ("kill", "--json"), ("list", "--force"), ("wat",),
-                     ("kill", "--all"), ("list", "123")]:
+                     ("kill", "--all"), ("list", "123"),
+                     ("history", "--minutes"), ("history", "--minutes", "0"),
+                     ("history", "--minutes", "1441"), ("history", "--minutes", "-1"),
+                     ("history", "--minutes", "30x"), ("history", "--force"),
+                     ("history", "123"), ("list", "--minutes", "30")]:
             with self.subTest(args=args):
                 self.assertEqual(cli(*args).returncode, 2)
 
     def test_help_and_version(self):
         self.assertIn("SIGKILL", cli("--help").stdout)
-        self.assertEqual(cli("--version").stdout.strip(), "1.0.0")
+        self.assertEqual(cli("--version").stdout.strip(), "1.1.0")
 
 
 if __name__ == "__main__":

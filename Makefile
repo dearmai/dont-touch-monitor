@@ -2,20 +2,23 @@ CC = clang
 CFLAGS = -std=c11 -O2 -Wall -Wextra -Werror -mmacosx-version-min=12.0
 LDLIBS = -framework CoreFoundation -framework IOKit
 BIN = dist/dont-touch-monitor
+SOURCES = src/main.c src/history.c
 
 .PHONY: all universal test clean
 all: $(BIN)
 
-$(BIN): src/main.c Makefile
+$(BIN): $(SOURCES) src/history.h Makefile
 	mkdir -p dist
-	$(CC) $(CFLAGS) $< $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(SOURCES) $(LDLIBS) -o $@
 
-universal: src/main.c Makefile
+universal: $(SOURCES) src/history.h Makefile
 	mkdir -p dist
-	$(CC) $(CFLAGS) -arch arm64 -arch x86_64 $< $(LDLIBS) -o $(BIN)
+	$(CC) $(CFLAGS) -arch arm64 -arch x86_64 $(SOURCES) $(LDLIBS) -o $(BIN)
 	codesign --force --sign - $(BIN)
 
 test: all
+	$(CC) $(CFLAGS) tests/history_test.c src/history.c -o dist/history-test
+	./dist/history-test
 	python3 tests/integration.py $(BIN)
 
 clean:

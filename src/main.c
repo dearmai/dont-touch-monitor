@@ -13,8 +13,9 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <wchar.h>
+#include "history.h"
 
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 
 typedef struct {
     pid_t pid;
@@ -336,14 +337,96 @@ static int terminate_processes(Snapshot *snapshot, pid_t *pids, size_t count, bo
     return status;
 }
 
+static void format_time(time_t timestamp, char buffer[32]) {
+    struct tm local;
+    localtime_r(&timestamp, &local);
+    strftime(buffer, 32, "%Y-%m-%d %H:%M:%S %z", &local);
+}
+
+static int show_history(int minutes, bool all, bool json) {
+    time_t to = time(NULL), from = to - minutes * 60;
+    History history = {0};
+    if (isatty(STDERR_FILENO)) fputs("전원 로그를 읽는 중입니다. 로그 크기에 따라 시간이 걸릴 수 있습니다.\n", stderr);
+    if (!history_load(from, to, all, &history)) { history_free(&history); return 1; }
+    char from_text[32], to_text[32];
+    format_time(from, from_text);
+    format_time(to, to_text);
+    int columns = 100;
+    struct winsize terminal = {0};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminal) == 0 && terminal.ws_col) columns = terminal.ws_col;
+    if (columns < 80) columns = 80;
+    if (columns > 120) columns = 120;
+    int widths[] = {8, 7, columns < 100 ? 12 : 18, 13, 0};
+    widths[4] = columns - 16 - widths[0] - widths[1] - widths[2] - widths[3];
+    if (json) {
+        printf("{\"version\":\"%s\",\"minutes\":%d,\"scope\":\"%s\",\"from\":", VERSION, minutes, all ? "all" : "display");
+        print_string(from_text, true);
+        printf(",\"to\":"); print_string(to_text, true);
+        printf(",\"events\":[");
+    } else {
+        printf("최근 %d분 전원 요청·화면 켜짐/꺼짐 기록\n%s ~ %s\n\n", minutes, from_text, to_text);
+        table_rule(widths);
+        table_row(widths, "시각", "PID", "앱 / 프로세스", "이벤트", "요청 내용");
+        table_rule(widths);
+    }
+    size_t requests = 0, display_changes = 0;
+    for (size_t i = 0; i < history.count; ++i) {
+        const HistoryEvent *event = &history.items[i];
+        bool display = event->pid == 0;
+        if (display) ++display_changes; else ++requests;
+        if (json) {
+            printf("%s{\"time\":", i ? "," : ""); print_string(event->time, true);
+            printf(",\"timestamp\":%lld,\"pid\":", (long long)event->timestamp);
+            if (display) printf("null"); else printf("%d", event->pid);
+            printf(",\"process\":");
+            if (display) printf("null"); else print_string(event->process, true);
+            printf(",\"action\":"); print_string(event->action, true);
+            printf(",\"type\":"); print_string(event->type, true);
+            printf(",\"name\":"); print_string(event->name, true);
+            printf("}");
+        } else {
+            char clock_text[9], pid[16], label[64];
+            // Display all rows in the current timezone; JSON preserves original offsets.
+            struct tm local;
+            localtime_r(&event->timestamp, &local);
+            strftime(clock_text, sizeof(clock_text), "%H:%M:%S", &local);
+            snprintf(pid, sizeof(pid), "%d", event->pid);
+            if (display) {
+                strlcpy(label, !strcmp(event->action, "DisplayOn") ? "화면 켜짐" : "화면 꺼짐", sizeof(label));
+            } else {
+                const char *kind = !strcmp(event->type, "UserIsActive") ? "활동" :
+                    (!strcmp(event->type, "PreventUserIdleDisplaySleep") ||
+                     !strcmp(event->type, "NoDisplaySleepAssertion")) ? "화면" : "시스템";
+                snprintf(label, sizeof(label), "%s %s", kind, !strcmp(event->action, "Created") ? "생성" : "활성");
+            }
+            table_row(widths, clock_text, display ? "-" : pid, display ? "-" : event->process,
+                      label, display ? "" : event->name);
+        }
+    }
+    if (json) puts("]}");
+    else {
+        table_rule(widths);
+        printf("요청 %zu건 · 화면 상태 변경 %zu건\n", requests, display_changes);
+        if (!history.count) puts("해당 기간에 저장된 관련 기록이 없습니다.");
+        puts("생성·활성화 기록만 표시합니다. 활동 요청은 정상 입력도 포함합니다.");
+        puts("과거 PID는 종료되거나 재사용될 수 있습니다. 종료 전 현재 list를 확인하세요.");
+        puts("종료된 프로세스의 부모 앱 정보는 전원 로그만으로 복원할 수 없습니다.");
+        puts("전체 내용: history --json / 시스템 잠자기 포함: history --all");
+    }
+    history_free(&history);
+    return 0;
+}
+
 static void usage(void) {
     puts("dont-touch-monitor " VERSION " — macOS 화면 꺼짐 방해 앱 진단/종료\n"
          "사용법:\n"
          "  dont-touch-monitor [list] [--all] [--json]\n"
+         "  dont-touch-monitor history [--minutes N] [--all] [--json]\n"
          "  dont-touch-monitor kill <PID>... [--force] [--dry-run]\n"
          "  dont-touch-monitor --help | --version\n\n"
          "  --all      시스템 잠자기 방지 요청까지 표시\n"
          "  --json     목록을 JSON으로 출력\n"
+         "  --minutes  history 조회 기간, 기본 30분 (1~1440)\n"
          "  --force    SIGTERM 대신 SIGKILL로 강제 종료 (미저장 내용 손실 가능)\n"
          "  --dry-run  대상을 검증하고 전송할 신호만 출력\n\n"
          "kill은 시스템 잠자기 방지 앱도 대상으로 허용합니다.\n"
@@ -354,16 +437,27 @@ int main(int argc, char **argv) {
     setlocale(LC_CTYPE, "");
     if (wcwidth(L'가') != 2) setlocale(LC_CTYPE, "en_US.UTF-8");
     bool do_kill = false, all = false, json = false, force = false, dry_run = false;
+    bool history = false;
+    int minutes = 30;
     int start = 1;
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) { usage(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "--version")) { puts(VERSION); return 0; }
     if (argc > 1 && !strcmp(argv[1], "kill")) { do_kill = true; start = 2; }
+    else if (argc > 1 && !strcmp(argv[1], "history")) { history = true; start = 2; }
     else if (argc > 1 && !strcmp(argv[1], "list")) start = 2;
     pid_t *pids = allocate((size_t)argc, sizeof(pid_t));
     size_t count = 0;
     for (int i = start; i < argc; ++i) {
         if (!do_kill && !strcmp(argv[i], "--all")) all = true;
         else if (!do_kill && !strcmp(argv[i], "--json")) json = true;
+        else if (history && !strcmp(argv[i], "--minutes")) {
+            if (++i >= argc || argv[i][0] < '0' || argv[i][0] > '9') goto invalid;
+            char *end;
+            errno = 0;
+            long value = strtol(argv[i], &end, 10);
+            if (errno || *end || value < 1 || value > 1440) goto invalid;
+            minutes = (int)value;
+        }
         else if (do_kill && !strcmp(argv[i], "--force")) force = true;
         else if (do_kill && !strcmp(argv[i], "--dry-run")) dry_run = true;
         else if (do_kill && argv[i][0] >= '0' && argv[i][0] <= '9') {
@@ -377,6 +471,7 @@ int main(int argc, char **argv) {
         } else goto invalid;
     }
     if (do_kill && !count) goto invalid;
+    if (history) { free(pids); return show_history(minutes, all, json); }
     Snapshot snapshot = {0};
     if (!scan(all || do_kill, &snapshot)) { free(pids); return 1; }
     int status = 0;
