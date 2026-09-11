@@ -46,6 +46,13 @@ class Integration(unittest.TestCase):
     def test_display_dry_run_and_sigterm(self):
         process, entry = self.blocker("-d")
         self.assertTrue(entry["can_terminate"])
+        self.assertEqual(entry["parent_pid"], os.getpid())
+        self.assertEqual(entry["ancestors"][0]["pid"], os.getpid())
+        self.assertEqual(entry["parent_name"], entry["ancestors"][0]["name"])
+        self.assertTrue(entry["ancestors"][0]["path"])
+        table = cli()
+        self.assertEqual(table.returncode, 0, table.stderr)
+        self.assertIn("부모 프로세스 (PID)", table.stdout)
         self.assertIn("PreventUserIdleDisplaySleep", [a["type"] for a in entry["assertions"]])
         self.assertIn(process.pid, [p["pid"] for p in listing()])
         preview = cli("kill", process.pid, "--force", "--dry-run")
@@ -98,7 +105,7 @@ class Integration(unittest.TestCase):
 
     def test_help_and_version(self):
         self.assertIn("SIGKILL", cli("--help").stdout)
-        self.assertEqual(cli("--version").stdout.strip(), "1.1.0")
+        self.assertEqual(cli("--version").stdout.strip(), "1.2.0")
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@
 #include <unistd.h>
 #include <wchar.h>
 #include "history.h"
+#include "parents.h"
 
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 
 typedef struct {
     pid_t pid;
@@ -25,6 +26,7 @@ typedef struct {
     char path[PROC_PIDPATHINFO_MAXSIZE];
     CFMutableArrayRef assertions;
     int rank;
+    Parents parents;
 } Blocker;
 
 typedef struct {
@@ -68,8 +70,7 @@ static int assertion_rank(CFDictionaryRef assertion, bool all) {
 }
 
 static bool identify(pid_t pid, struct proc_bsdinfo *info) {
-    memset(info, 0, sizeof(*info));
-    return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, sizeof(*info)) == sizeof(*info);
+    return process_identify(pid, info);
 }
 
 static int compare(const void *a, const void *b) {
@@ -121,6 +122,7 @@ static bool scan(bool all, Snapshot *out) {
         } else {
             strlcpy(b->name, "(종료됨/정보 없음)", sizeof(b->name));
         }
+        if (b->identified) parents_read(b->pid, &b->info, &b->parents);
     }
     qsort(out->items, out->count, sizeof(Blocker), compare);
     free(keys);
@@ -195,20 +197,20 @@ static void table_cell(const char *text, int width) {
     while (used++ < width) putchar(' ');
 }
 
-static void table_rule(const int widths[5]) {
+static void table_rule_n(const int *widths, int count) {
     putchar('+');
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < count; ++i) {
         for (int j = 0; j < widths[i] + 2; ++j) putchar('-');
         putchar('+');
     }
     putchar('\n');
 }
 
-static void table_row(const int widths[5], const char *pid, const char *app,
-                      const char *type, const char *status, const char *detail) {
-    const char *cells[] = {pid, app, type, status, detail};
+static void table_rule(const int widths[5]) { table_rule_n(widths, 5); }
+
+static void table_row_n(const int *widths, int count, const char **cells) {
     putchar('|');
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < count; ++i) {
         putchar(' ');
         table_cell(cells[i], widths[i]);
         printf(" |");
@@ -216,23 +218,40 @@ static void table_row(const int widths[5], const char *pid, const char *app,
     putchar('\n');
 }
 
+static void table_row(const int widths[5], const char *pid, const char *app,
+                      const char *type, const char *status, const char *detail) {
+    const char *cells[] = {pid, app, type, status, detail};
+    table_row_n(widths, 5, cells);
+}
+
+static void print_parents(const Parents *parents) {
+    putchar('[');
+    for (size_t i = 0; i < parents->count; ++i) {
+        const Parent *p = &parents->items[i];
+        printf("%s{\"pid\":%d,\"name\":", i ? "," : "", p->pid);
+        print_string(p->name, true);
+        printf(",\"path\":"); print_string(p->path, true);
+        printf("}");
+    }
+    putchar(']');
+}
+
 static void show(const Snapshot *snapshot, bool json, bool all) {
     struct winsize terminal = {0};
-    int columns = 100;
+    int columns = 120;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminal) == 0 && terminal.ws_col)
         columns = terminal.ws_col;
     // Keep useful column widths even on very narrow terminals.
-    if (columns < 80) columns = 80;
-    if (columns > 120) columns = 120;
-    int widths[] = {7, columns < 100 ? 16 : 20, 13, 6, 0};
-    widths[4] = columns - 16 - widths[0] - widths[1] - widths[2] - widths[3];
+    if (columns < 100) columns = 100;
+    if (columns > 160) columns = 160;
+    int widths[] = {7, 16, 24, 13, 6, columns - 85};
     if (json) printf("{\"version\":\"%s\",\"scope\":\"%s\",\"processes\":[", VERSION, all ? "all" : "display");
     else {
         puts(all ? "화면 꺼짐·시스템 잠자기 관련 전원 요청" : "화면 꺼짐 관련 전원 요청");
         putchar('\n');
-        table_rule(widths);
-        table_row(widths, "PID", "앱 / 프로세스", "방해 유형", "종료", "요청 내용");
-        table_rule(widths);
+        table_rule_n(widths, 6);
+        table_row_n(widths, 6, (const char *[]){"PID", "앱 / 프로세스", "부모 프로세스 (PID)", "방해 유형", "종료", "요청 내용"});
+        table_rule_n(widths, 6);
     }
     for (size_t i = 0; i < snapshot->count; ++i) {
         const Blocker *b = &snapshot->items[i];
@@ -241,6 +260,11 @@ static void show(const Snapshot *snapshot, bool json, bool all) {
             printf("%s{\"pid\":%d,\"name\":", i ? "," : "", b->pid);
             print_string(b->name, true);
             printf(",\"path\":"); print_string(b->path, true);
+            printf(",\"parent_pid\":");
+            if (b->parents.count) printf("%d", b->parents.items[0].pid); else printf("null");
+            printf(",\"parent_name\":");
+            if (b->parents.count) print_string(b->parents.items[0].name, true); else printf("null");
+            printf(",\"ancestors\":"); print_parents(&b->parents);
             printf(",\"can_terminate\":%s,\"protection_reason\":", reason ? "false" : "true");
             if (reason) print_string(reason, true); else printf("null");
             printf(",\"assertions\":[");
@@ -257,16 +281,19 @@ static void show(const Snapshot *snapshot, bool json, bool all) {
             } else {
                 char pid[16];
                 snprintf(pid, sizeof(pid), "%d", b->pid);
-                table_row(widths, j == 0 ? pid : "", j == 0 ? b->name : "",
+                char parent[PROC_PIDPATHINFO_MAXSIZE + 32];
+                if (b->parents.count) snprintf(parent, sizeof(parent), "%s (%d)", b->parents.items[0].name, b->parents.items[0].pid);
+                else strlcpy(parent, "확인 불가", sizeof(parent));
+                table_row_n(widths, 6, (const char *[]){j == 0 ? pid : "", j == 0 ? b->name : "", j == 0 ? parent : "",
                           rank == 1 ? "화면 꺼짐" : rank == 2 ? "사용자 활동" : "시스템 잠자기",
-                          j == 0 ? (reason ? "보호됨" : "가능") : "", name);
+                          j == 0 ? (reason ? "보호됨" : "가능") : "", name});
             }
             free(type); free(name);
         }
         if (json) printf("]}");
         else {
-            if (reason) table_row(widths, "", "", "종료 제한", "", reason);
-            table_rule(widths);
+            if (reason) table_row_n(widths, 6, (const char *[]){"", "", "", "종료 제한", "", reason});
+            table_rule_n(widths, 6);
         }
     }
     if (json) puts("]}");
